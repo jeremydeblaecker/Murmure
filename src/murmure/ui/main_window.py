@@ -166,7 +166,6 @@ class MainWindow(QMainWindow):
         self.text_view.setPlainText(chapter.text)
         self.current_chunks = chunk_text(chapter.text)
         self.current_chunk_index = 0
-        self._save_progress()
 
     def start_reading(self) -> None:
         if not self.tts:
