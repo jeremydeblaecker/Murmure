@@ -203,7 +203,7 @@ Murmure est pensé comme une application locale :
 ### V0.2
 
 - [x] pré-génération du morceau suivant pendant la lecture ;
-- [ ] sauvegarde de la position de lecture ;
+- [x] sauvegarde de la position de lecture ;
 - [ ] réglage fin des pauses ;
 - [ ] meilleure détection des dialogues ;
 - [ ] sélection de plusieurs voix françaises ;
