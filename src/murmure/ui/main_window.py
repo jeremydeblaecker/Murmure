@@ -23,15 +23,17 @@ from murmure.tts.kokoro import KokoroEngine
 
 
 class SynthesisWorker(QThread):
-    ready = Signal(str)
-    failed = Signal(str)
+    ready = Signal(int, int, str)
+    failed = Signal(int, int, str)
 
-    def __init__(self, engine: KokoroEngine, cache: AudioCache, text: str, speed: float) -> None:
+    def __init__(self, engine: KokoroEngine, cache: AudioCache, text: str, speed: float, chunk_index: int, generation: int) -> None:
         super().__init__()
         self.engine = engine
         self.cache = cache
         self.text = text
         self.speed = speed
+        self.chunk_index = chunk_index
+        self.generation = generation
 
     def run(self) -> None:
         try:
@@ -39,9 +41,9 @@ class SynthesisWorker(QThread):
             path = self.cache.path_for(self.text, self.engine.name, voice, self.speed)
             if not path.exists():
                 self.engine.synthesize(self.text, path, voice=voice, speed=self.speed)
-            self.ready.emit(str(path))
+            self.ready.emit(self.chunk_index, self.generation, str(path))
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(self.chunk_index, self.generation, str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -53,7 +55,10 @@ class MainWindow(QMainWindow):
         self.chapters: list[Chapter] = []
         self.current_chunks: list[str] = []
         self.current_chunk_index = 0
+        self.generation = 0
         self.worker: SynthesisWorker | None = None
+        self.prefetched_paths: dict[int, str] = {}
+        self.pending_play_index: int | None = None
         self.cache = AudioCache()
 
         try:
@@ -136,6 +141,12 @@ class MainWindow(QMainWindow):
     def show_chapter(self, index: int) -> None:
         if index < 0 or index >= len(self.chapters):
             return
+
+        self.player.stop()
+        self.generation += 1
+        self.prefetched_paths.clear()
+        self.pending_play_index = None
+
         chapter = self.chapters[index]
         self.text_view.setPlainText(chapter.text)
         self.current_chunks = chunk_text(chapter.text)
@@ -150,37 +161,102 @@ class MainWindow(QMainWindow):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
             self.player.play()
             return
-        self._synthesize_current_chunk()
 
-    def _synthesize_current_chunk(self) -> None:
-        if not self.tts or self.current_chunk_index >= len(self.current_chunks):
-            self.status.setText("Chapitre terminé.")
+        self._ensure_chunk(self.current_chunk_index, play_when_ready=True)
+
+    def _cache_path_for(self, chunk_index: int) -> Path:
+        text = self.current_chunks[chunk_index]
+        speed = self.speed_slider.value() / 100
+        return self.cache.path_for(text, "kokoro-onnx", "ff_siwis", speed)
+
+    def _ensure_chunk(self, chunk_index: int, play_when_ready: bool) -> None:
+        if not self.tts or chunk_index >= len(self.current_chunks):
+            if play_when_ready:
+                self.status.setText("Chapitre terminé.")
             return
 
-        text = self.current_chunks[self.current_chunk_index]
-        speed = self.speed_slider.value() / 100
-        self.status.setText(
-            f"Synthèse {self.current_chunk_index + 1}/{len(self.current_chunks)}…"
-        )
+        if chunk_index in self.prefetched_paths:
+            if play_when_ready:
+                self._play_chunk(chunk_index, self.prefetched_paths[chunk_index])
+            return
 
-        self.worker = SynthesisWorker(self.tts, self.cache, text, speed)
-        self.worker.ready.connect(self._play_file)
+        cache_path = self._cache_path_for(chunk_index)
+        if cache_path.exists():
+            self.prefetched_paths[chunk_index] = str(cache_path)
+            if play_when_ready:
+                self._play_chunk(chunk_index, str(cache_path))
+            return
+
+        if self.worker and self.worker.isRunning():
+            if play_when_ready:
+                self.pending_play_index = chunk_index
+                self.status.setText(f"Préparation {chunk_index + 1}/{len(self.current_chunks)}…")
+            return
+
+        self._start_synthesis(chunk_index, play_when_ready)
+
+    def _start_synthesis(self, chunk_index: int, play_when_ready: bool) -> None:
+        if not self.tts:
+            return
+
+        text = self.current_chunks[chunk_index]
+        speed = self.speed_slider.value() / 100
+        if play_when_ready:
+            self.pending_play_index = chunk_index
+            self.status.setText(f"Synthèse {chunk_index + 1}/{len(self.current_chunks)}…")
+        else:
+            self.status.setText(f"Lecture {self.current_chunk_index + 1}/{len(self.current_chunks)} · préparation suivante…")
+
+        self.worker = SynthesisWorker(self.tts, self.cache, text, speed, chunk_index, self.generation)
+        self.worker.ready.connect(self._on_synthesis_ready)
         self.worker.failed.connect(self._on_tts_error)
+        self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
 
-    def _play_file(self, path: str) -> None:
+    def _on_synthesis_ready(self, chunk_index: int, generation: int, path: str) -> None:
+        if generation != self.generation:
+            return
+
+        self.prefetched_paths[chunk_index] = path
+        if self.pending_play_index == chunk_index:
+            self.pending_play_index = None
+            self._play_chunk(chunk_index, path)
+
+    def _on_worker_finished(self) -> None:
+        self.worker = None
+
+        if self.pending_play_index is not None:
+            pending = self.pending_play_index
+            self._ensure_chunk(pending, play_when_ready=True)
+            return
+
+        next_index = self.current_chunk_index + 1
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState and next_index < len(self.current_chunks):
+            self._ensure_chunk(next_index, play_when_ready=False)
+
+    def _play_chunk(self, chunk_index: int, path: str) -> None:
+        if chunk_index != self.current_chunk_index:
+            return
+
         self.player.setSource(QUrl.fromLocalFile(str(Path(path).resolve())))
         self.player.play()
-        self.status.setText(
-            f"Lecture {self.current_chunk_index + 1}/{len(self.current_chunks)}"
-        )
+        self.status.setText(f"Lecture {chunk_index + 1}/{len(self.current_chunks)}")
 
-    def _on_tts_error(self, message: str) -> None:
+        next_index = chunk_index + 1
+        if next_index < len(self.current_chunks):
+            self._ensure_chunk(next_index, play_when_ready=False)
+
+    def _on_tts_error(self, chunk_index: int, generation: int, message: str) -> None:
+        if generation != self.generation:
+            return
+        if self.pending_play_index == chunk_index:
+            self.pending_play_index = None
         self.status.setText("Erreur de synthèse")
         QMessageBox.critical(self, "Erreur TTS", message)
 
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.current_chunk_index += 1
-            self._synthesize_current_chunk()
+        if status != QMediaPlayer.MediaStatus.EndOfMedia:
+            return
 
+        self.current_chunk_index += 1
+        self._ensure_chunk(self.current_chunk_index, play_when_ready=True)
