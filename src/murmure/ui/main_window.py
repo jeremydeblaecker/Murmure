@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QUrl, Signal
+from PySide6.QtCore import QThread, QUrl, Signal, Qt
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -184,5 +184,3 @@ class MainWindow(QMainWindow):
             self.current_chunk_index += 1
             self._synthesize_current_chunk()
 
-
-from PySide6.QtCore import Qt
