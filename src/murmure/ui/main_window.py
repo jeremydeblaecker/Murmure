@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from murmure.epub.reader import Chapter, load_epub
+from murmure.progress import ProgressStore, ReadingProgress
 from murmure.text.chunker import chunk_text
 from murmure.tts.cache import AudioCache
 from murmure.tts.kokoro import KokoroEngine
@@ -60,6 +61,8 @@ class MainWindow(QMainWindow):
         self.prefetched_paths: dict[int, str] = {}
         self.pending_play_index: int | None = None
         self.cache = AudioCache()
+        self.progress_store = ProgressStore()
+        self.current_book_path: str | None = None
 
         try:
             self.tts = KokoroEngine()
@@ -130,13 +133,25 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erreur EPUB", str(exc))
             return
 
+        self.current_book_path = file_path
         self.chapter_list.clear()
         for chapter in self.chapters:
             self.chapter_list.addItem(chapter.title)
 
-        if self.chapters:
-            self.chapter_list.setCurrentRow(0)
-        self.status.setText(f"{Path(file_path).name} — {len(self.chapters)} chapitre(s)")
+        restored = self.progress_store.load(file_path)
+        if restored:
+            self.speed_slider.setValue(int(restored.speed * 100))
+            chapter_index = min(max(restored.chapter_index, 0), max(len(self.chapters) - 1, 0))
+            if self.chapters:
+                self.chapter_list.setCurrentRow(chapter_index)
+                self.current_chunk_index = min(max(restored.chunk_index, 0), max(len(self.current_chunks) - 1, 0))
+            self.status.setText(
+                f"{Path(file_path).name} — reprise chapitre {chapter_index + 1}, passage {self.current_chunk_index + 1}"
+            )
+        else:
+            if self.chapters:
+                self.chapter_list.setCurrentRow(0)
+            self.status.setText(f"{Path(file_path).name} — {len(self.chapters)} chapitre(s)")
 
     def show_chapter(self, index: int) -> None:
         if index < 0 or index >= len(self.chapters):
@@ -151,6 +166,7 @@ class MainWindow(QMainWindow):
         self.text_view.setPlainText(chapter.text)
         self.current_chunks = chunk_text(chapter.text)
         self.current_chunk_index = 0
+        self._save_progress()
 
     def start_reading(self) -> None:
         if not self.tts:
@@ -241,6 +257,7 @@ class MainWindow(QMainWindow):
         self.player.setSource(QUrl.fromLocalFile(str(Path(path).resolve())))
         self.player.play()
         self.status.setText(f"Lecture {chunk_index + 1}/{len(self.current_chunks)}")
+        self._save_progress()
 
         next_index = chunk_index + 1
         if next_index < len(self.current_chunks):
@@ -254,9 +271,32 @@ class MainWindow(QMainWindow):
         self.status.setText("Erreur de synthèse")
         QMessageBox.critical(self, "Erreur TTS", message)
 
+
+    def _save_progress(self) -> None:
+        if not self.current_book_path:
+            return
+
+        chapter_index = self.chapter_list.currentRow()
+        if chapter_index < 0:
+            return
+
+        progress = ReadingProgress(
+            book_id=self.progress_store.book_id(self.current_book_path),
+            path=self.current_book_path,
+            chapter_index=chapter_index,
+            chunk_index=self.current_chunk_index,
+            speed=self.speed_slider.value() / 100,
+        )
+        self.progress_store.save(progress)
+
+    def closeEvent(self, event) -> None:
+        self._save_progress()
+        super().closeEvent(event)
+
     def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
         if status != QMediaPlayer.MediaStatus.EndOfMedia:
             return
 
         self.current_chunk_index += 1
+        self._save_progress()
         self._ensure_chunk(self.current_chunk_index, play_when_ready=True)
